@@ -28,11 +28,12 @@ app.get("/webhook", (req, res) => {
 });
 
 // ================== 2) Webhook receiver ==================
+// ALL incoming text messages are treated as questions.
 app.post("/webhook", (req, res) => {
-  // Always ACK Meta immediately
+  // ACK Meta immediately
   res.sendStatus(200);
 
-  // Process async after ACK
+  // Process asynchronously after ACK
   (async () => {
     try {
       console.log("WEBHOOK HIT:", JSON.stringify(req.body, null, 2));
@@ -50,58 +51,18 @@ app.post("/webhook", (req, res) => {
       // Only handle text for now
       const rawText =
         type === "text" ? (message.text?.body || "").trim() : "";
+
       if (!rawText) return;
 
-      // Detect @PrinceLab mention (case-insensitive, with or without .au)
-      const lowerRaw = rawText.toLowerCase();
-      const mentionedBot = lowerRaw.includes("@princelab");
+      // Optional: strip @PrinceLab mention if someone uses it in a group
+      // (harmless for 1:1 too)
+      const cleanedText = rawText.replace(/@princelab(\.au)?/gi, "").trim();
 
-      // Strip the mention out for command parsing
-      const text = rawText.replace(/@princelab(\.au)?/gi, "").trim();
-      const normalized = text.toLowerCase().replace(/\s+/g, " ").trim();
+      console.log("Incoming:", from, `"${rawText}"`, "cleaned:", `"${cleanedText}"`);
 
-      console.log(
-        "Incoming:",
-        from,
-        `"${rawText}"`,
-        "mentionedBot:",
-        mentionedBot,
-        "normalized:",
-        `"${normalized}"`
-      );
+      const questionToAsk = cleanedText.length > 0 ? cleanedText : rawText;
 
-      let replyText = "";
-
-      // ---------- pl help ----------
-      if (normalized === "pl help") {
-        replyText =
-          'Try:\n' +
-          '- "pl ask why is the sky blue?"\n' +
-          '- "pl plan Sunday family outing in Point Cook"\n' +
-          '- In a group: "@PrinceLab.au what should we do this Sunday?"';
-
-      // ---------- pl ask ----------
-      } else if (normalized.startsWith("pl ask")) {
-        const question = text.slice(6).trim(); // remove "pl ask"
-        if (!question) {
-          replyText = 'Ask something after "pl ask".';
-        } else {
-          replyText = await askAI(question);
-        }
-
-      // ---------- pl plan ----------
-      } else if (normalized.startsWith("pl plan")) {
-        const task = text.slice(7).trim(); // remove "pl plan"
-        replyText = await planWithAI(task || "Plan something simple.");
-
-      // ---------- Mention without explicit command ----------
-      } else if (mentionedBot && normalized.length > 0) {
-        replyText = await askAI(text);
-
-      // ---------- Fallback ----------
-      } else {
-        replyText = `You said: ${rawText}`;
-      }
+      const replyText = await askAI(questionToAsk);
 
       if (replyText) {
         await sendWhatsAppText(from, replyText);
@@ -112,7 +73,7 @@ app.post("/webhook", (req, res) => {
   })();
 });
 
-// ================== OpenAI helpers ==================
+// ================== OpenAI helper ==================
 async function askAI(question) {
   try {
     const completion = await openai.chat.completions.create({
@@ -121,7 +82,7 @@ async function askAI(question) {
         {
           role: "system",
           content:
-            "You are a concise WhatsApp assistant. Answer in 2–4 short sentences. No markdown."
+            "You are a concise WhatsApp assistant. Answer in 2–4 short sentences. Plain text only."
         },
         { role: "user", content: question }
       ]
@@ -134,31 +95,10 @@ async function askAI(question) {
   }
 }
 
-async function planWithAI(details) {
-  try {
-    const completion = await openai.chat.completions.create({
-      model: "gpt-4.1-mini",
-      messages: [
-        {
-          role: "system",
-          content:
-            "You plan things for busy families in Australia. Reply with 3–5 short bullet points. Plain text."
-        },
-        { role: "user", content: details }
-      ]
-    });
-
-    return completion.choices?.[0]?.message?.content?.trim() || "Unsure about answer";
-  } catch (e) {
-    console.error("planWithAI error:", e.response?.data || e.message);
-    return "Unsure about answer";
-  }
-}
-
 // ================== WhatsApp send helper ==================
 async function sendWhatsAppText(to, body) {
   if (!WHATSAPP_TOKEN || !WHATSAPP_PHONE_ID) {
-    console.error("Missing WHATSAPP_TOKEN or WHATSAPP_PHONE_ID");
+    console.error("Missing WHATSAPP_ACCESS_TOKEN or WHATSAPP_PHONE_NUMBER_ID");
     return;
   }
 
