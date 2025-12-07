@@ -36,20 +36,36 @@ app.post("/webhook", async (req, res) => {
     res.sendStatus(200);
     if (!message) return;
 
-    const from = message.from;
+        const from = message.from;
     const type = message.type;
-    const text = type === "text" ? message.text.body.trim() : "";
+    const rawText = type === "text" ? message.text.body.trim() : "";
 
-    // Normalise spaces / case so triggers are easier to match
+    // Detect @PrinceLab.au mention (case-insensitive, with or without .au)
+    const lowerRaw = rawText.toLowerCase();
+    const mentionedBot = lowerRaw.includes("@princelab");
+
+    // Strip the mention out for command parsing
+    let text = rawText.replace(/@princelab(\.au)?/gi, "").trim();
+
+    // If the user only wrote "@PrinceLab.au" and nothing else,
+    // treat the whole thing as empty command text
     const normalized = text.toLowerCase().replace(/\s+/g, " ").trim();
-    console.log("Incoming:", from, `"${text}"`, "normalized:", `"${normalized}"`);
+
+    console.log(
+      "Incoming:",
+      from,
+      `"${rawText}"`,
+      "mentionedBot:",
+      mentionedBot,
+      "normalized:",
+      `"${normalized}"`
+    );
 
     let replyText;
 
-    // ---- pl ask ----
+        // ---- pl ask ----
     if (normalized.startsWith("pl ask")) {
-      const idx = text.toLowerCase().indexOf("pl ask");
-      const question = text.slice(idx + "pl ask".length).trim();
+      const question = text.slice(text.toLowerCase().indexOf("pl ask") + "pl ask".length).trim();
 
       if (!question) {
         replyText = 'Ask something after "pl ask".';
@@ -75,8 +91,7 @@ app.post("/webhook", async (req, res) => {
 
     // ---- pl plan ----
     } else if (normalized.startsWith("pl plan")) {
-      const idx = text.toLowerCase().indexOf("pl plan");
-      const task = text.slice(idx + "pl plan".length).trim();
+      const task = text.slice(text.toLowerCase().indexOf("pl plan") + "pl plan".length).trim();
 
       try {
         const completion = await openai.chat.completions.create({
@@ -99,20 +114,33 @@ app.post("/webhook", async (req, res) => {
     // ---- pl help ----
     } else if (normalized === "pl help") {
       replyText =
-        'Try:\n- "pl ask why is the sky blue?"\n- "pl plan Sunday family outing in Point Cook"\nAnything else I just echo back.';
+        'Try:\n- "pl ask why is the sky blue?"\n- "pl plan Sunday family outing in Point Cook"\nOr in a group: "@PrinceLab.au what happened in the last 50 messages?"';
+
+    // ---- Mention without explicit pl ask/plan → treat as question ----
+    } else if (mentionedBot && normalized.length > 0) {
+      try {
+        const completion = await openai.chat.completions.create({
+          model: "gpt-4.1-mini",
+          messages: [
+            {
+              role: "system",
+              content:
+                "You are a concise WhatsApp assistant. Answer in 2–4 short sentences.",
+            },
+            { role: "user", content: text },
+          ],
+        });
+        replyText = completion.choices[0].message.content.trim();
+      } catch (err) {
+        console.error("OpenAI error (mention only):", err);
+        replyText = "Unsure about answer";
+      }
 
     // ---- fallback echo ----
     } else {
-      replyText = `You said: ${text}`;
+      replyText = `You said: ${rawText}`;
     }
 
-    if (replyText) {
-      await sendWhatsAppText(from, replyText);
-    }
-  } catch (err) {
-    console.error("Webhook error:", err);
-    // we already sent 200 above
-  }
 });
 
 
