@@ -1,7 +1,6 @@
 import express from "express";
 import axios from "axios";
 import OpenAI from "openai";
-import rateLimit from "express-rate-limit";
 
 const app = express();
 app.use(express.json());
@@ -22,18 +21,47 @@ const SUMMARY_MODEL = process.env.SUMMARY_MODEL || "gpt-4.1-nano";
 
 const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 
-// ================== RATE LIMITS ==================
+// =====================================================
+// 1) CUSTOM ENDPOINT RATE LIMIT (NO EXTRA PACKAGE)
+// =====================================================
+// Generous limiter for /webhook to avoid breaking Meta retries
+function createEndpointLimiter({ windowMs, max }) {
+  const hits = new Map(); // key -> { count, start }
 
-// 1) Endpoint-level limiter (generous for Meta retries)
-const webhookLimiter = rateLimit({
-  windowMs: 60 * 1000, // 1 min
-  max: 200,
-  standardHeaders: true,
-  legacyHeaders: false,
+  return (req, res, next) => {
+    const now = Date.now();
+    const key =
+      req.headers["x-forwarded-for"]?.split(",")[0]?.trim() ||
+      req.socket?.remoteAddress ||
+      "unknown";
+
+    const rec = hits.get(key);
+
+    if (!rec || now - rec.start >= windowMs) {
+      hits.set(key, { count: 1, start: now });
+      return next();
+    }
+
+    rec.count += 1;
+
+    if (rec.count > max) {
+      return res.status(429).send("Rate limit exceeded");
+    }
+
+    return next();
+  };
+}
+
+const webhookLimiter = createEndpointLimiter({
+  windowMs: 60 * 1000, // 1 minute
+  max: Number(process.env.WEBHOOK_MAX_PER_MIN || 200),
 });
+
 app.use("/webhook", webhookLimiter);
 
-// 2) Per-user AI limiter
+// =====================================================
+// 2) PER-USER AI RATE LIMIT
+// =====================================================
 const userRate = new Map();
 const PER_MIN = Number(process.env.PER_USER_PER_MIN || 6);
 const PER_HOUR = Number(process.env.PER_USER_PER_HOUR || 60);
@@ -55,11 +83,13 @@ function checkUserLimit(userId) {
   return { ok: true };
 }
 
-// ================== CONTEXT STORE (IN-MEMORY) ==================
-// Rules you asked for:
+// =====================================================
+// 3) CONTEXT STORE (IN-MEMORY) WITH SUMMARY RULES
+// =====================================================
+// Your rules:
 // - Keep max 100 messages per user (user+assistant combined).
-// - Use last 50 messages as raw context.
-// - Messages older than that (up to 100 total) are summarized.
+// - Use last 50 as raw context.
+// - Summarise older part (from start up to olderCount).
 // - Hard stop at 100 stored messages.
 
 const historyByUser = new Map();
@@ -72,7 +102,7 @@ function getRecord(userId) {
     historyByUser.set(userId, {
       messages: [],
       summary: "",
-      summarizedCount: 0, // how many messages from the start are included in summary
+      summarizedCount: 0, // count of earliest messages included in summary
       lastSeen: Date.now(),
     });
   }
@@ -87,8 +117,7 @@ function trimToLimit(record) {
 
   const overflow = msgs.length - HISTORY_LIMIT;
 
-  // If we're dropping messages that were not yet summarized,
-  // advance summarizedCount so indices remain consistent.
+  // Adjust summarizedCount since we are dropping from the front
   record.summarizedCount = Math.max(0, record.summarizedCount - overflow);
 
   msgs.splice(0, overflow);
@@ -110,7 +139,10 @@ function pushToHistory(userId, role, content) {
         oldestKey = k;
       }
     }
-    if (oldestKey) historyByUser.delete(oldestKey);
+    if (oldestKey) {
+      historyByUser.delete(oldestKey);
+      userRate.delete(oldestKey);
+    }
   }
 }
 
@@ -126,7 +158,9 @@ setInterval(() => {
   }
 }, 30 * 60 * 1000).unref();
 
-// ================== 1) Webhook verification ==================
+// =====================================================
+// 4) WEBHOOK VERIFICATION
+// =====================================================
 app.get("/webhook", (req, res) => {
   const mode = req.query["hub.mode"];
   const token = req.query["hub.verify_token"];
@@ -138,7 +172,9 @@ app.get("/webhook", (req, res) => {
   return res.sendStatus(403);
 });
 
-// ================== 2) Webhook receiver ==================
+// =====================================================
+// 5) WEBHOOK RECEIVER
+// =====================================================
 app.post("/webhook", (req, res) => {
   // ACK Meta immediately
   res.sendStatus(200);
@@ -180,17 +216,16 @@ app.post("/webhook", (req, res) => {
         return;
       }
 
-      // 1) Store user message
+      // Store user message
       pushToHistory(from, "user", userText);
 
-      // 2) Build reply with context rules
+      // Ask AI with smart context
       const replyText = await askAIWithSmartContext(from);
 
-      // 3) Send reply
+      // Send reply
       if (replyText) {
         await sendWhatsAppText(from, replyText);
-
-        // 4) Store assistant reply
+        // Store assistant reply
         pushToHistory(from, "assistant", replyText);
       }
     } catch (err) {
@@ -199,25 +234,23 @@ app.post("/webhook", (req, res) => {
   })();
 });
 
-// ================== SMART CONTEXT + SUMMARIES ==================
+// =====================================================
+// 6) SMART CONTEXT + SUMMARY UPDATER
+// =====================================================
 async function askAIWithSmartContext(userId) {
   const record = getRecord(userId);
   const msgs = record.messages;
 
   try {
-    // If more than last 50 exist, summarize older chunk incrementally
     const olderCount = Math.max(0, msgs.length - RECENT_RAW_LIMIT);
 
     if (olderCount > 0) {
-      // We only need to summarize messages from the start up to olderCount
-      // Ensure our summary covers that range
       if (record.summarizedCount < olderCount) {
         const newChunk = msgs.slice(record.summarizedCount, olderCount);
         record.summary = await updateSummary(record.summary, newChunk);
         record.summarizedCount = olderCount;
       }
     } else {
-      // If conversation is short again, reset summary state
       record.summary = "";
       record.summarizedCount = 0;
     }
@@ -256,7 +289,6 @@ async function askAIWithSmartContext(userId) {
 async function updateSummary(existingSummary, newMessages) {
   if (!newMessages || newMessages.length === 0) return existingSummary || "";
 
-  // Convert new messages into a compact text block for summarization
   const chunkText = newMessages
     .map((m) => `${m.role.toUpperCase()}: ${m.content}`)
     .join("\n");
@@ -285,12 +317,13 @@ async function updateSummary(existingSummary, newMessages) {
     return completion.choices?.[0]?.message?.content?.trim() || existingSummary || "";
   } catch (e) {
     console.error("Summary error:", e.response?.data || e.message);
-    // If summary fails, fall back to existing summary
     return existingSummary || "";
   }
 }
 
-// ================== WhatsApp send helper ==================
+// =====================================================
+// 7) WHATSAPP SEND HELPER
+// =====================================================
 async function sendWhatsAppText(to, body) {
   if (!WHATSAPP_TOKEN || !WHATSAPP_PHONE_ID) {
     console.error("Missing WHATSAPP_ACCESS_TOKEN or WHATSAPP_PHONE_NUMBER_ID");
@@ -318,8 +351,11 @@ async function sendWhatsAppText(to, body) {
   }
 }
 
-// ================== Server ==================
+// =====================================================
+// 8) SERVER
+// =====================================================
 const PORT = process.env.PORT || 3000;
+
 app.listen(PORT, () => {
   console.log(`PrinceLab bot listening on port ${PORT}`);
 });
