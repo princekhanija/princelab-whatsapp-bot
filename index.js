@@ -32,22 +32,68 @@ app.post("/webhook", async (req, res) => {
     const change = entry?.changes?.[0];
     const message = change?.value?.messages?.[0];
 
-    // Always ACK quickly
+    // Always ACK quickly so Meta doesn’t retry
     res.sendStatus(200);
     if (!message) return;
 
     const from = message.from;
     const type = message.type;
     const text = type === "text" ? message.text.body.trim() : "";
+    const lower = text.toLowerCase();
 
     console.log("Incoming:", from, text);
 
-    await sendWhatsAppText(from, `You said: ${text}`);
+    let replyText;
+
+    if (lower.startsWith("pl ask ")) {
+      const question = text.slice(7).trim();
+      if (!question) {
+        replyText = 'Ask something after "pl ask".';
+      } else {
+        const completion = await openai.chat.completions.create({
+          model: "gpt-4.1-mini",
+          messages: [
+            {
+              role: "system",
+              content:
+                "You are a concise WhatsApp assistant. Answer in 2–4 short sentences.",
+            },
+            { role: "user", content: question },
+          ],
+        });
+        replyText = completion.choices[0].message.content.trim();
+      }
+    } else if (lower.startsWith("pl plan ")) {
+      const task = text.slice(8).trim();
+      const completion = await openai.chat.completions.create({
+        model: "gpt-4.1-mini",
+        messages: [
+          {
+            role: "system",
+            content:
+              "You plan things for busy families in Australia. Give a clear, bullet-point style plan.",
+          },
+          { role: "user", content: task },
+        ],
+      });
+      replyText = completion.choices[0].message.content.trim();
+    } else if (lower === "pl help") {
+      replyText =
+        'Try:\n- "pl ask why is the sky blue?"\n- "pl plan Sunday family outing in Point Cook"\nAnything else I just echo back.';
+    } else {
+      // Fallback echo
+      replyText = `You said: ${text}`;
+    }
+
+    if (replyText) {
+      await sendWhatsAppText(from, replyText);
+    }
   } catch (err) {
-    console.error("Webhook error:", err.message);
-    res.sendStatus(200);
+    console.error("Webhook error:", err);
+    // we already sent 200, so no need to respond again
   }
 });
+
 
 // --- OpenAI helpers ---
 
