@@ -27,38 +27,25 @@ app.get("/webhook", (req, res) => {
 app.post("/webhook", async (req, res) => {
   try {
     console.log("WEBHOOK HIT:", JSON.stringify(req.body, null, 2));
+
     const entry = req.body.entry?.[0];
     const change = entry?.changes?.[0];
     const message = change?.value?.messages?.[0];
 
     // Always ACK quickly
     res.sendStatus(200);
-
     if (!message) return;
 
     const from = message.from;
     const type = message.type;
     const text = type === "text" ? message.text.body.trim() : "";
 
-    const lower = text.toLowerCase();
-    const isTrigger = lower.startsWith("pl ") || lower.startsWith("@princelab");
+    console.log("Incoming:", from, text);
 
-    if (!isTrigger) return;
-
-    let reply = "Try:\n• pl ask <question>\n• pl plan <what/when/where>";
-
-    if (lower.startsWith("pl ask")) {
-      const question = text.slice(6).trim();
-      reply = await askAI(question || "Explain what you can do.");
-    } else if (lower.startsWith("pl plan")) {
-      const details = text.slice(7).trim() || "a simple catch-up";
-      reply = await planWithAI(details);
-    }
-
-    await sendWhatsAppText(from, reply);
+    await sendWhatsAppText(from, `You said: ${text}`);
   } catch (err) {
     console.error("Webhook error:", err.message);
-    // We already sent 200 above, nothing else to do
+    res.sendStatus(200);
   }
 });
 
