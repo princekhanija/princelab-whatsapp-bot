@@ -32,56 +32,77 @@ app.post("/webhook", async (req, res) => {
     const change = entry?.changes?.[0];
     const message = change?.value?.messages?.[0];
 
-    // Always ACK quickly so Meta doesn’t retry
+    // ACK Meta quickly
     res.sendStatus(200);
     if (!message) return;
 
     const from = message.from;
     const type = message.type;
     const text = type === "text" ? message.text.body.trim() : "";
-    const lower = text.toLowerCase();
 
-    console.log("Incoming:", from, text);
+    // Normalise spaces / case so triggers are easier to match
+    const normalized = text.toLowerCase().replace(/\s+/g, " ").trim();
+    console.log("Incoming:", from, `"${text}"`, "normalized:", `"${normalized}"`);
 
     let replyText;
 
-    if (lower.startsWith("pl ask ")) {
-      const question = text.slice(7).trim();
+    // ---- pl ask ----
+    if (normalized.startsWith("pl ask")) {
+      const idx = text.toLowerCase().indexOf("pl ask");
+      const question = text.slice(idx + "pl ask".length).trim();
+
       if (!question) {
         replyText = 'Ask something after "pl ask".';
       } else {
+        try {
+          const completion = await openai.chat.completions.create({
+            model: "gpt-4.1-mini",
+            messages: [
+              {
+                role: "system",
+                content:
+                  "You are a concise WhatsApp assistant. Answer in 2–4 short sentences.",
+              },
+              { role: "user", content: question },
+            ],
+          });
+          replyText = completion.choices[0].message.content.trim();
+        } catch (err) {
+          console.error("OpenAI error (pl ask):", err);
+          replyText = "Unsure about answer";
+        }
+      }
+
+    // ---- pl plan ----
+    } else if (normalized.startsWith("pl plan")) {
+      const idx = text.toLowerCase().indexOf("pl plan");
+      const task = text.slice(idx + "pl plan".length).trim();
+
+      try {
         const completion = await openai.chat.completions.create({
           model: "gpt-4.1-mini",
           messages: [
             {
               role: "system",
               content:
-                "You are a concise WhatsApp assistant. Answer in 2–4 short sentences.",
+                "You plan things for busy families in Australia. Give a clear, bullet-point style plan.",
             },
-            { role: "user", content: question },
+            { role: "user", content: task || "Plan something simple." },
           ],
         });
         replyText = completion.choices[0].message.content.trim();
+      } catch (err) {
+        console.error("OpenAI error (pl plan):", err);
+        replyText = "Unsure about answer";
       }
-    } else if (lower.startsWith("pl plan ")) {
-      const task = text.slice(8).trim();
-      const completion = await openai.chat.completions.create({
-        model: "gpt-4.1-mini",
-        messages: [
-          {
-            role: "system",
-            content:
-              "You plan things for busy families in Australia. Give a clear, bullet-point style plan.",
-          },
-          { role: "user", content: task },
-        ],
-      });
-      replyText = completion.choices[0].message.content.trim();
-    } else if (lower === "pl help") {
+
+    // ---- pl help ----
+    } else if (normalized === "pl help") {
       replyText =
         'Try:\n- "pl ask why is the sky blue?"\n- "pl plan Sunday family outing in Point Cook"\nAnything else I just echo back.';
+
+    // ---- fallback echo ----
     } else {
-      // Fallback echo
       replyText = `You said: ${text}`;
     }
 
@@ -90,9 +111,10 @@ app.post("/webhook", async (req, res) => {
     }
   } catch (err) {
     console.error("Webhook error:", err);
-    // we already sent 200, so no need to respond again
+    // we already sent 200 above
   }
 });
+
 
 
 // --- OpenAI helpers ---
